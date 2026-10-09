@@ -1,248 +1,404 @@
-//! Optional image generation provider. No credentials or response bodies appear in errors.
+//! Optional image generation providers: Google Gemini and OpenAI.
+//!
+//! Nothing here runs unless a key is in the environment (`GEMINI_API_KEY` or `GOOGLE_API_KEY`,
+//! `OPENAI_API_KEY`). Keys live in process memory only: they travel in one HTTPS header and
+//! never appear in URLs, request bodies, errors, logs or saved documents. Errors never quote a
+//! response body either, because a service's free-text message can echo the request.
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
-use base64::Engine as _;
-use serde_json::{Value, json};
+mod gemini;
+mod openai;
+mod pixels;
 
-#[cfg(not(target_arch = "wasm32"))]
-const BASE: &str = "https://api.openai.com/v1/images";
-const MAX_RESPONSE: usize = 32 * 1024 * 1024;
+pub use gemini::{ASPECT_RATIOS, GEMINI_DEFAULT_MODEL, GeminiProvider};
+pub use openai::{OPENAI_DEFAULT_MODEL, OpenAiProvider};
+
+pub(crate) const MAX_RESPONSE: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_INPUT: usize = 20 * 1024 * 1024;
+
+/// Google AI Studio key for Gemini (the name Google's docs and SDKs use).
+pub const GEMINI_KEY_ENV: &str = "GEMINI_API_KEY";
+/// Accepted as a fallback for [`GEMINI_KEY_ENV`]; Google's docs name both.
+pub const GOOGLE_KEY_ENV: &str = "GOOGLE_API_KEY";
+pub const OPENAI_KEY_ENV: &str = "OPENAI_API_KEY";
+/// `gemini` or `openai`: picks the provider when both keys are set (Gemini wins otherwise).
+pub const PROVIDER_ENV: &str = "PHOTOCRAFT_GEN_PROVIDER";
 
 #[derive(Debug, thiserror::Error)]
 pub enum GenError {
-    #[error("Generative AI is off: set OPENAI_API_KEY")]
+    #[error("Generative AI is off: set GEMINI_API_KEY (Google Gemini) or OPENAI_API_KEY (OpenAI) in the app's environment")]
     MissingKey,
+    #[error("Generative AI is off: {provider} needs {variables} in the app's environment")]
+    MissingProviderKey { provider: &'static str, variables: &'static str },
+    #[error("PHOTOCRAFT_GEN_PROVIDER must be `gemini` or `openai`")]
+    UnknownProvider,
     #[error("invalid image request: {0}")]
     Invalid(&'static str),
     #[error("image service unavailable: {0}")]
     Service(&'static str),
-    #[error("image service returned HTTP {0}")]
-    Http(u16),
+    #[error("{provider} declined the request ({reason}); change the prompt or image and try again")]
+    Blocked { provider: &'static str, reason: &'static str },
+    #[error("{provider} returned HTTP {status}{}: {}", code_suffix(.code), http_hint(.status))]
+    Http { provider: &'static str, status: u16, code: Option<&'static str> },
+}
+
+fn code_suffix(code: &Option<&'static str>) -> String {
+    code.map(|c| format!(" ({c})")).unwrap_or_default()
+}
+
+fn http_hint(status: &u16) -> &'static str {
+    match status {
+        400 => "the request was rejected; check the model, prompt, image and API key",
+        401 => "the API key is missing, invalid or expired",
+        402 => "the prepaid credit balance is used up",
+        403 => "the API key has no permission for this model or project",
+        404 => "the model was not found; check the `model` parameter",
+        408 | 504 => "the request timed out; try again",
+        429 => "rate limit or quota exceeded; wait a moment and try again",
+        500..=599 => "the service had a problem; try again later",
+        _ => "the request failed",
+    }
 }
 
 pub type Result<T> = std::result::Result<T, GenError>;
 
-/// All images and masks are PNG bytes; a mask's transparent pixels are repainted.
+/// An image service. Inputs are PNG bytes; a mask's transparent pixels mark the area to
+/// repaint. Results are PNG or JPEG bytes.
 pub trait ImageProvider: Send + Sync {
+    /// Short display name for progress messages, such as `Gemini`.
+    fn name(&self) -> &'static str;
+    /// The `size` to request when the result will fill a `width` x `height` area.
+    fn size_for(&self, width: u32, height: u32) -> String;
+    /// Whether a returned `width` x `height` image answers a request for `size`.
+    fn accepts(&self, size: &str, width: u32, height: u32) -> bool;
     fn generate(&self, prompt: &str, size: &str) -> Result<Vec<u8>>;
     fn edit(&self, image: &[u8], mask: &[u8], prompt: &str, size: &str) -> Result<Vec<u8>>;
     fn variations(&self, image: &[u8], prompt: &str, size: &str) -> Result<Vec<u8>>;
 }
 
-/// Injectable transport; tests can inspect a request without sending it.
-pub trait HttpTransport: Send + Sync {
-    fn post(&self, path: &str, key: &str, content_type: &str, body: &[u8]) -> Result<Vec<u8>>;
+impl<P: ImageProvider + ?Sized> ImageProvider for Box<P> {
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+    fn size_for(&self, width: u32, height: u32) -> String {
+        (**self).size_for(width, height)
+    }
+    fn accepts(&self, size: &str, width: u32, height: u32) -> bool {
+        (**self).accepts(size, width, height)
+    }
+    fn generate(&self, prompt: &str, size: &str) -> Result<Vec<u8>> {
+        (**self).generate(prompt, size)
+    }
+    fn edit(&self, image: &[u8], mask: &[u8], prompt: &str, size: &str) -> Result<Vec<u8>> {
+        (**self).edit(image, mask, prompt, size)
+    }
+    fn variations(&self, image: &[u8], prompt: &str, size: &str) -> Result<Vec<u8>> {
+        (**self).variations(image, prompt, size)
+    }
 }
 
-/// Blocking HTTPS transport, intended for an engine background job.
+/// How a request proves who it is. `Debug` never prints the key.
+#[derive(Clone, Copy)]
+pub enum Auth<'a> {
+    /// `Authorization: Bearer <key>` (OpenAI).
+    Bearer(&'a str),
+    /// `x-goog-api-key: <key>` (Gemini API).
+    GoogleApiKey(&'a str),
+}
+
+impl Auth<'_> {
+    /// The header name and value to send.
+    pub fn header(&self) -> (&'static str, String) {
+        match self {
+            Auth::Bearer(key) => ("Authorization", format!("Bearer {key}")),
+            Auth::GoogleApiKey(key) => ("x-goog-api-key", (*key).to_owned()),
+        }
+    }
+}
+
+impl std::fmt::Debug for Auth<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Auth::Bearer(_) => "Bearer(<redacted>)",
+            Auth::GoogleApiKey(_) => "GoogleApiKey(<redacted>)",
+        })
+    }
+}
+
+/// One HTTPS POST. `Debug` shows the endpoint and sizes, never the key or the body.
+#[derive(Clone, Copy)]
+pub struct HttpRequest<'a> {
+    pub url: &'a str,
+    pub auth: Auth<'a>,
+    pub content_type: &'a str,
+    pub body: &'a [u8],
+}
+
+impl std::fmt::Debug for HttpRequest<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpRequest")
+            .field("url", &self.url)
+            .field("auth", &self.auth)
+            .field("content_type", &self.content_type)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
+}
+
+/// Any HTTP status comes back as a response; providers turn non-2xx into [`GenError::Http`].
+pub struct HttpResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
+/// Injectable transport; tests can inspect a request without sending it.
+pub trait HttpTransport: Send + Sync {
+    fn post(&self, request: &HttpRequest<'_>) -> Result<HttpResponse>;
+}
+
+/// The only endpoints a request may go to.
+#[cfg(not(target_arch = "wasm32"))]
+const ALLOWED_ENDPOINTS: [&str; 2] = ["https://api.openai.com/v1/images/", gemini::GEMINI_BASE];
+
+/// Blocking HTTPS transport, intended for an engine background job. Native only.
 pub struct UreqTransport;
 
 #[cfg(not(target_arch = "wasm32"))]
 impl HttpTransport for UreqTransport {
-    fn post(&self, path: &str, key: &str, content_type: &str, body: &[u8]) -> Result<Vec<u8>> {
+    fn post(&self, request: &HttpRequest<'_>) -> Result<HttpResponse> {
         use std::io::Read as _;
         use std::time::Duration;
-        let config = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(180))).https_only(true).max_redirects(0).build();
+        if !ALLOWED_ENDPOINTS.iter().any(|base| request.url.starts_with(base)) {
+            return Err(GenError::Invalid("endpoint not allowed"));
+        }
+        let config =
+            ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(180))).https_only(true).max_redirects(0).http_status_as_error(false).build();
         let agent = config.new_agent();
-        let url = format!("{BASE}{path}");
-        let mut response = match agent.post(&url).header("Authorization", format!("Bearer {key}")).header("Content-Type", content_type).send(body) {
+        let (name, value) = request.auth.header();
+        let mut response = match agent.post(request.url).header(name, value).header("Content-Type", request.content_type).send(request.body) {
             Ok(r) => r,
-            Err(ureq::Error::StatusCode(code)) => return Err(GenError::Http(code)),
+            Err(ureq::Error::Timeout(_)) => return Err(GenError::Service("the request timed out")),
             Err(_) => return Err(GenError::Service("HTTPS connection failed")),
         };
-        let mut bytes = Vec::new();
-        response.body_mut().as_reader().take((MAX_RESPONSE + 1) as u64).read_to_end(&mut bytes).map_err(|_| GenError::Service("could not read response"))?;
-        if bytes.len() > MAX_RESPONSE {
+        let status = response.status().as_u16();
+        let mut body = Vec::new();
+        response.body_mut().as_reader().take((MAX_RESPONSE + 1) as u64).read_to_end(&mut body).map_err(|_| GenError::Service("could not read response"))?;
+        if body.len() > MAX_RESPONSE {
             return Err(GenError::Service("response too large"));
         }
-        Ok(bytes)
+        Ok(HttpResponse { status, body })
     }
 }
 
 #[cfg(target_arch = "wasm32")]
 impl HttpTransport for UreqTransport {
-    fn post(&self, _: &str, _: &str, _: &str, _: &[u8]) -> Result<Vec<u8>> {
+    fn post(&self, _: &HttpRequest<'_>) -> Result<HttpResponse> {
         Err(GenError::Service("image generation requires the desktop app"))
     }
 }
 
-/// OpenAI implementation. `key` remains process memory only; never serialize this type.
-pub struct OpenAiProvider<T: HttpTransport = UreqTransport> {
-    key: String,
-    model: String,
-    transport: T,
+/// Which service the image commands use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderKind {
+    Gemini,
+    OpenAi,
 }
 
-impl OpenAiProvider<UreqTransport> {
-    pub fn from_env(model: Option<&str>) -> Result<Self> {
-        let key = std::env::var("OPENAI_API_KEY").ok().filter(|k| !k.trim().is_empty()).ok_or(GenError::MissingKey)?;
-        Self::new(key, model.unwrap_or("gpt-image-1"), UreqTransport)
-    }
+/// Reads an environment variable; unset, non-Unicode and blank values count as unset.
+pub fn env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
-impl<T: HttpTransport> OpenAiProvider<T> {
-    pub fn new(key: String, model: &str, transport: T) -> Result<Self> {
-        if key.trim().is_empty() {
-            return Err(GenError::MissingKey);
-        }
-        if !model.starts_with("gpt-image") || model.len() > 80 || !model.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.') {
-            return Err(GenError::Invalid("invalid gpt-image model"));
-        }
-        Ok(Self { key, model: model.to_owned(), transport })
-    }
+pub(crate) fn gemini_key(env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let get = |name: &str| env(name).filter(|v| !v.trim().is_empty());
+    get(GEMINI_KEY_ENV).or_else(|| get(GOOGLE_KEY_ENV))
+}
 
-    fn request(&self, path: &str, content_type: &str, body: &[u8]) -> Result<Vec<u8>> {
-        let response = self.transport.post(path, &self.key, content_type, body)?;
-        if response.len() > MAX_RESPONSE {
-            return Err(GenError::Service("response too large"));
-        }
-        let value: Value = serde_json::from_slice(&response).map_err(|_| GenError::Service("invalid JSON response"))?;
-        let data = value
-            .get("data")
-            .and_then(Value::as_array)
-            .and_then(|a| a.first())
-            .and_then(|v| v.get("b64_json"))
-            .and_then(Value::as_str)
-            .ok_or(GenError::Service("response missing b64_json image"))?;
-        if data.len() > MAX_RESPONSE {
-            return Err(GenError::Service("image too large"));
-        }
-        base64::engine::general_purpose::STANDARD.decode(data).map_err(|_| GenError::Service("invalid base64 image"))
-    }
-
-    fn multipart(&self, image: &[u8], mask: Option<&[u8]>, prompt: &str, size: &str) -> Result<Vec<u8>> {
-        validate(prompt, size)?;
-        if image.is_empty() || image.len() > 20 * 1024 * 1024 {
-            return Err(GenError::Invalid("PNG image is empty or too large"));
-        }
-        if mask.is_some_and(|m| m.is_empty() || m.len() > 20 * 1024 * 1024) {
-            return Err(GenError::Invalid("PNG mask is empty or too large"));
-        }
-        // A boundary absent from binary input. A constant is safe after checking both buffers.
-        let mut boundary = "photocraft-boundary-1".to_owned();
-        while prompt.contains(&boundary)
-            || image.windows(boundary.len()).any(|w| w == boundary.as_bytes())
-            || mask.is_some_and(|m| m.windows(boundary.len()).any(|w| w == boundary.as_bytes()))
-        {
-            boundary.push('x');
-        }
-        let mut body = Vec::new();
-        field(&mut body, &boundary, "model", self.model.as_bytes());
-        field(&mut body, &boundary, "prompt", prompt.as_bytes());
-        field(&mut body, &boundary, "size", size.as_bytes());
-        field(&mut body, &boundary, "output_format", b"png");
-        file(&mut body, &boundary, "image", image);
-        if let Some(m) = mask {
-            file(&mut body, &boundary, "mask", m);
-        }
-        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-        self.request("/edits", &format!("multipart/form-data; boundary={boundary}"), &body)
+/// Picks the provider from the environment (`env` looks variables up, so tests need not touch
+/// the process environment): `PHOTOCRAFT_GEN_PROVIDER` decides when set; otherwise Gemini
+/// when its key is set, then OpenAI; with no key the commands stay off.
+pub fn choose_provider(env: &dyn Fn(&str) -> Option<String>) -> Result<ProviderKind> {
+    let get = |name: &str| env(name).filter(|v| !v.trim().is_empty());
+    let gemini = gemini_key(env).is_some();
+    let openai = get(OPENAI_KEY_ENV).is_some();
+    match get(PROVIDER_ENV).map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("gemini") if gemini => Ok(ProviderKind::Gemini),
+        Some("gemini") => Err(GenError::MissingProviderKey { provider: "Gemini", variables: "GEMINI_API_KEY (or GOOGLE_API_KEY)" }),
+        Some("openai") if openai => Ok(ProviderKind::OpenAi),
+        Some("openai") => Err(GenError::MissingProviderKey { provider: "OpenAI", variables: OPENAI_KEY_ENV }),
+        Some(_) => Err(GenError::UnknownProvider),
+        None if gemini => Ok(ProviderKind::Gemini),
+        None if openai => Ok(ProviderKind::OpenAi),
+        None => Err(GenError::MissingKey),
     }
 }
 
-impl<T: HttpTransport> ImageProvider for OpenAiProvider<T> {
-    fn generate(&self, prompt: &str, size: &str) -> Result<Vec<u8>> {
-        validate(prompt, size)?;
-        let body = json!({"model":self.model,"prompt":prompt,"size":size,"output_format":"png"});
-        let bytes = serde_json::to_vec(&body).map_err(|_| GenError::Service("could not prepare request"))?;
-        self.request("/generations", "application/json", &bytes)
-    }
-    fn edit(&self, image: &[u8], mask: &[u8], prompt: &str, size: &str) -> Result<Vec<u8>> {
-        self.multipart(image, Some(mask), prompt, size)
-    }
-    fn variations(&self, image: &[u8], prompt: &str, size: &str) -> Result<Vec<u8>> {
-        // GPT image models support prompt-guided variations through edits.
-        self.multipart(image, None, prompt, size)
+/// The provider the environment selects, with `model` or that provider's default model.
+pub fn provider_from_env(model: Option<&str>) -> Result<Box<dyn ImageProvider>> {
+    build_provider(&env_var, model, UreqTransport)
+}
+
+/// [`provider_from_env`] with an injectable environment and transport.
+pub fn build_provider<T: HttpTransport + 'static>(env: &dyn Fn(&str) -> Option<String>, model: Option<&str>, transport: T) -> Result<Box<dyn ImageProvider>> {
+    match choose_provider(env)? {
+        ProviderKind::Gemini => {
+            let key = gemini_key(env).ok_or(GenError::MissingKey)?;
+            Ok(Box::new(GeminiProvider::new(key, model.unwrap_or(GEMINI_DEFAULT_MODEL), transport)?))
+        }
+        ProviderKind::OpenAi => {
+            let key = env(OPENAI_KEY_ENV).filter(|v| !v.trim().is_empty()).ok_or(GenError::MissingKey)?;
+            Ok(Box::new(OpenAiProvider::new(key, model.unwrap_or(OPENAI_DEFAULT_MODEL), transport)?))
+        }
     }
 }
 
-fn validate(prompt: &str, size: &str) -> Result<()> {
+/// Whether `size` is one any provider understands: the OpenAI sizes, `auto`, or a Gemini
+/// aspect ratio. The selected provider still rejects the ones it cannot serve.
+pub fn is_known_size(size: &str) -> bool {
+    gemini::aspect_ratio(size).is_ok()
+}
+
+pub(crate) fn validate_prompt(prompt: &str) -> Result<()> {
     if prompt.trim().is_empty() || prompt.len() > 32_000 {
         return Err(GenError::Invalid("prompt is empty or too long"));
-    }
-    if !matches!(size, "1024x1024" | "1024x1536" | "1536x1024" | "auto") {
-        return Err(GenError::Invalid("unsupported size"));
     }
     Ok(())
 }
 
-fn field(body: &mut Vec<u8>, boundary: &str, name: &str, value: &[u8]) {
-    body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes());
-    body.extend_from_slice(value);
-    body.extend_from_slice(b"\r\n");
-}
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use std::sync::Mutex;
 
-fn file(body: &mut Vec<u8>, boundary: &str, name: &str, value: &[u8]) {
-    body.extend_from_slice(
-        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"image.png\"\r\nContent-Type: image/png\r\n\r\n").as_bytes(),
-    );
-    body.extend_from_slice(value);
-    body.extend_from_slice(b"\r\n");
+    pub struct Recorded {
+        pub url: String,
+        pub auth: (String, String),
+        pub content_type: String,
+        pub body: Vec<u8>,
+    }
+
+    pub struct Mock {
+        pub requests: Mutex<Vec<Recorded>>,
+        replies: Mutex<Vec<Result<HttpResponse>>>,
+    }
+
+    impl Mock {
+        pub fn new(replies: Vec<Result<HttpResponse>>) -> Self {
+            Self { requests: Mutex::new(Vec::new()), replies: Mutex::new(replies) }
+        }
+    }
+
+    impl HttpTransport for Mock {
+        fn post(&self, r: &HttpRequest<'_>) -> Result<HttpResponse> {
+            let (name, value) = r.auth.header();
+            self.requests.lock().map_err(|_| GenError::Service("test lock"))?.push(Recorded {
+                url: r.url.into(),
+                auth: (name.into(), value),
+                content_type: r.content_type.into(),
+                body: r.body.to_vec(),
+            });
+            let mut replies = self.replies.lock().map_err(|_| GenError::Service("test lock"))?;
+            if replies.is_empty() { ok(200, br#"{"data":[{"b64_json":"AQID"}]}"#) } else { replies.remove(0) }
+        }
+    }
+
+    pub fn ok(status: u16, body: &[u8]) -> Result<HttpResponse> {
+        Ok(HttpResponse { status, body: body.to_vec() })
+    }
+
+    pub fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    pub fn png_rgba(w: u32, h: u32, f: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> {
+        let mut data = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                data.extend_from_slice(&f(x, y));
+            }
+        }
+        let image = photocraft_codecs::Image::from_u8(w, h, photocraft_codecs::ChannelLayout::Rgba, data).unwrap();
+        photocraft_codecs::encode(&image, photocraft_codecs::Format::Png, &Default::default()).unwrap()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-    type Request = (String, String, String, Vec<u8>);
-    struct Mock {
-        requests: Mutex<Vec<Request>>,
-        replies: Mutex<Vec<Result<Vec<u8>>>>,
-    }
-    impl Mock {
-        fn new(replies: Vec<Result<Vec<u8>>>) -> Self {
-            Self { requests: Mutex::new(Vec::new()), replies: Mutex::new(replies) }
-        }
-    }
-    impl HttpTransport for Mock {
-        fn post(&self, path: &str, key: &str, content_type: &str, body: &[u8]) -> Result<Vec<u8>> {
-            self.requests.lock().map_err(|_| GenError::Service("test lock"))?.push((path.into(), key.into(), content_type.into(), body.to_vec()));
-            let mut replies = self.replies.lock().map_err(|_| GenError::Service("test lock"))?;
-            if replies.is_empty() { Ok(br#"{"data":[{"b64_json":"AQID"}]}"#.to_vec()) } else { replies.remove(0) }
-        }
-    }
-    #[test]
-    fn requests_are_mockable_and_have_expected_shapes() {
-        let p = OpenAiProvider::new("secret".into(), "gpt-image-1", Mock::new(Vec::new())).unwrap();
-        assert_eq!(p.generate("cat", "1024x1024").unwrap(), [1, 2, 3]);
-        p.edit(b"png", b"mask", "fill", "1024x1024").unwrap();
-        p.variations(b"png", "similar", "1024x1024").unwrap();
-        let r = p.transport.requests.lock().unwrap();
-        assert_eq!(r.len(), 3);
-        assert_eq!(r[0].0, "/generations");
-        assert_eq!(r[0].1, "secret");
-        assert_eq!(r[0].2, "application/json");
-        assert_eq!(serde_json::from_slice::<Value>(&r[0].3).unwrap(), json!({"model":"gpt-image-1","prompt":"cat","size":"1024x1024","output_format":"png"}));
-        assert!(r[1].2.starts_with("multipart/form-data; boundary="));
-        assert!(r[1].3.windows(b"name=\"image\"".len()).any(|w| w == b"name=\"image\""));
-        assert!(r[1].3.windows(b"name=\"mask\"".len()).any(|w| w == b"name=\"mask\""));
-        assert!(r[1].3.windows(b"1024x1024".len()).any(|w| w == b"1024x1024"));
-        assert_eq!(r[2].0, "/edits");
-        assert!(!r[2].3.windows(b"name=\"mask\"".len()).any(|w| w == b"name=\"mask\""));
+    use std::collections::HashMap;
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+        move |name| map.get(name).cloned()
     }
 
     #[test]
-    fn response_failures_and_credentials_are_redacted() {
-        let secret = "sentinel-test-secret";
-        for reply in [
-            Err(GenError::Http(401)),
-            Err(GenError::Http(429)),
-            Err(GenError::Http(500)),
-            Ok(b"{".to_vec()),
-            Ok(br#"{"data":[{"b64_json":"%%%"}]}"#.to_vec()),
-            Ok(br#"{"data":[]}"#.to_vec()),
-        ] {
-            let p = OpenAiProvider::new(secret.into(), "gpt-image-1", Mock::new(vec![reply])).unwrap();
-            let e = p.generate("cat", "1024x1024").unwrap_err();
-            assert!(!format!("{e} {e:?}").contains(secret));
+    fn provider_selection_prefers_gemini_and_honors_the_override() {
+        use ProviderKind::*;
+        let pick = |pairs: &[(&str, &str)]| choose_provider(&env(pairs));
+        assert_eq!(pick(&[("GEMINI_API_KEY", "g")]).unwrap(), Gemini);
+        assert_eq!(pick(&[("GOOGLE_API_KEY", "g")]).unwrap(), Gemini);
+        assert_eq!(pick(&[("OPENAI_API_KEY", "o")]).unwrap(), OpenAi);
+        assert_eq!(pick(&[("OPENAI_API_KEY", "o"), ("GEMINI_API_KEY", "g")]).unwrap(), Gemini);
+        assert_eq!(pick(&[("OPENAI_API_KEY", "o"), ("GEMINI_API_KEY", "g"), ("PHOTOCRAFT_GEN_PROVIDER", "openai")]).unwrap(), OpenAi);
+        assert_eq!(pick(&[("OPENAI_API_KEY", "o"), ("GEMINI_API_KEY", "g"), ("PHOTOCRAFT_GEN_PROVIDER", " Gemini ")]).unwrap(), Gemini);
+        assert_eq!(pick(&[("OPENAI_API_KEY", "o"), ("GEMINI_API_KEY", "  "), ("PHOTOCRAFT_GEN_PROVIDER", "")]).unwrap(), OpenAi);
+        let off = pick(&[]).unwrap_err().to_string();
+        assert!(off.contains("GEMINI_API_KEY") && off.contains("OPENAI_API_KEY"), "{off}");
+        let wrong = pick(&[("OPENAI_API_KEY", "o"), ("PHOTOCRAFT_GEN_PROVIDER", "gemini")]).unwrap_err().to_string();
+        assert!(wrong.contains("Gemini needs GEMINI_API_KEY"), "{wrong}");
+        let wrong = pick(&[("GEMINI_API_KEY", "g"), ("PHOTOCRAFT_GEN_PROVIDER", "openai")]).unwrap_err().to_string();
+        assert!(wrong.contains("OpenAI needs OPENAI_API_KEY"), "{wrong}");
+        assert!(matches!(pick(&[("GEMINI_API_KEY", "g"), ("PHOTOCRAFT_GEN_PROVIDER", "dall-e")]), Err(GenError::UnknownProvider)));
+    }
+
+    #[test]
+    fn built_provider_uses_the_chosen_key_and_default_model() {
+        use test_support::{Mock, ok};
+        let png = test_support::png_rgba(1, 1, |_, _| [0, 0, 0, 255]);
+        let reply = serde_json::json!({"candidates":[{"content":{"parts":[{"inlineData":{"mimeType":"image/png","data":
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png)}}]}}]});
+        let mock = std::sync::Arc::new(Mock::new(vec![ok(200, reply.to_string().as_bytes())]));
+        struct Shared(std::sync::Arc<Mock>);
+        impl HttpTransport for Shared {
+            fn post(&self, r: &HttpRequest<'_>) -> Result<HttpResponse> {
+                self.0.post(r)
+            }
         }
-        let missing = OpenAiProvider::new(" ".into(), "gpt-image-1", Mock::new(Vec::new())).err().unwrap();
-        assert!(matches!(missing, GenError::MissingKey));
-        assert!(missing.to_string().starts_with("Generative AI is off"));
-        let p = OpenAiProvider::new(secret.into(), "gpt-image-1", Mock::new(Vec::new())).unwrap();
-        assert!(matches!(p.generate(" ", "1024x1024"), Err(GenError::Invalid(_))));
-        assert!(matches!(p.generate("cat", "99x99"), Err(GenError::Invalid(_))));
-        assert!(p.transport.requests.lock().unwrap().is_empty());
+        let both = env(&[("GEMINI_API_KEY", "gem"), ("GOOGLE_API_KEY", "goo"), ("OPENAI_API_KEY", "oai")]);
+        let p = build_provider(&both, None, Shared(mock.clone())).unwrap();
+        assert_eq!(p.name(), "Gemini");
+        p.generate("x", "1:1").unwrap();
+        let r = mock.requests.lock().unwrap();
+        assert_eq!(r[0].auth, ("x-goog-api-key".to_owned(), "gem".to_owned()));
+        assert!(r[0].url.contains("/models/gemini-nano-banana-2.1:generateContent"));
+        drop(r);
+        let google_only = env(&[("GOOGLE_API_KEY", "goo")]);
+        assert_eq!(build_provider(&google_only, Some("gemini-3-pro-image"), Shared(mock.clone())).unwrap().name(), "Gemini");
+        let openai = env(&[("OPENAI_API_KEY", "oai")]);
+        assert_eq!(build_provider(&openai, None, Shared(mock.clone())).unwrap().name(), "OpenAI");
+        // A model for the other provider is an actionable error, not a silent switch.
+        let e = build_provider(&both, Some("gpt-image-1"), Shared(mock.clone())).err().unwrap().to_string();
+        assert!(e.contains("PHOTOCRAFT_GEN_PROVIDER=openai"), "{e}");
+        assert!(build_provider(&env(&[]), None, Shared(mock)).is_err());
+    }
+
+    #[test]
+    fn transport_refuses_unlisted_endpoints() {
+        let r = HttpRequest { url: "https://example.com/v1beta/models/x", auth: Auth::GoogleApiKey("k"), content_type: "application/json", body: b"{}" };
+        assert!(matches!(UreqTransport.post(&r), Err(GenError::Invalid(_))));
+        let r = HttpRequest { url: "http://generativelanguage.googleapis.com/v1beta/models/x", ..r };
+        assert!(matches!(UreqTransport.post(&r), Err(GenError::Invalid(_))));
+    }
+
+    #[test]
+    fn known_sizes_cover_both_providers() {
+        for size in ["1024x1024", "1024x1536", "1536x1024", "auto", "16:9", "21:9"] {
+            assert!(is_known_size(size), "{size}");
+        }
+        for size in ["", "1:4", "512x512", "16:9 "] {
+            assert!(!is_known_size(size), "{size}");
+        }
     }
 }

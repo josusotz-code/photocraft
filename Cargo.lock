@@ -3719,6 +3719,7 @@ name = "photocraft-gen"
 version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
+ "photocraft-codecs",
  "serde_json",
  "thiserror 2.0.21",
  "ureq",
