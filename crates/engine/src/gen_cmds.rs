@@ -1,9 +1,10 @@
-//! Optional OpenAI image commands. The worker owns a snapshot and applies one undo step.
+//! Optional generative image commands (Google Gemini or OpenAI, chosen by `photocraft_gen`).
+//! The worker owns a snapshot and applies one undo step.
 use photocraft_cms::{Builtin, Intent, Transform};
 use photocraft_codecs::{self as codecs, ChannelLayout, Format, Image, SampleType as CodecSample};
 use photocraft_color::{ColorMode, PixelFormat, SampleType};
 use photocraft_doc::{Document, Layer, Size};
-use photocraft_gen::{ImageProvider, OpenAiProvider};
+use photocraft_gen::ImageProvider;
 use photocraft_geom::Rect;
 use photocraft_raster::Surface;
 use serde_json::{Value, json};
@@ -42,10 +43,7 @@ fn key_enabled(s: &Session) -> std::result::Result<(), String> {
     if s.active().is_none() {
         return Err("no document open".into());
     }
-    if std::env::var("OPENAI_API_KEY").ok().is_none_or(|v| v.trim().is_empty()) {
-        return Err("Generative AI is off: set OPENAI_API_KEY".into());
-    }
-    Ok(())
+    photocraft_gen::choose_provider(&photocraft_gen::env_var).map(|_| ()).map_err(|e| e.to_string())
 }
 
 fn bad(cmd: &str, msg: &str) -> EngineError {
@@ -70,8 +68,8 @@ fn size<'a>(p: &'a Value, cmd: &str) -> Result<&'a str> {
         return Err(bad(cmd, "`size` must be text"));
     }
     let v = p.get("size").and_then(Value::as_str).unwrap_or("1024x1024");
-    if !matches!(v, "1024x1024" | "1024x1536" | "1536x1024" | "auto") {
-        return Err(bad(cmd, "`size` must be 1024x1024, 1024x1536, 1536x1024, or auto"));
+    if !photocraft_gen::is_known_size(v) {
+        return Err(bad(cmd, "`size` must be 1024x1024, 1024x1536, 1536x1024, auto, or (Gemini) an aspect ratio such as 16:9"));
     }
     Ok(v)
 }
@@ -80,15 +78,6 @@ fn limit(r: Rect, cmd: &str) -> Result<()> {
         return Err(bad(cmd, "image too large for generative AI (maximum 4096 px per side and 16 MP)"));
     }
     Ok(())
-}
-fn coded_size(w: u32, h: u32) -> &'static str {
-    if w > h.saturating_mul(5) / 4 {
-        "1536x1024"
-    } else if h > w.saturating_mul(5) / 4 {
-        "1024x1536"
-    } else {
-        "1024x1024"
-    }
 }
 fn fit(s: &Surface, r: Rect) -> (Surface, Rect) {
     let k = (1024.0 / f64::from(r.width())).min(1024.0 / f64::from(r.height())).min(1.0);
@@ -111,12 +100,17 @@ fn png(s: &Surface, r: Rect) -> Result<Vec<u8>> {
     let img = Image::from_u8(r.width(), r.height(), ChannelLayout::Rgba, s.to_interleaved(r)).map_err(other)?;
     codecs::encode(&img, Format::Png, &Default::default()).map_err(other)
 }
-fn decode_png(bytes: &[u8]) -> Result<(Surface, Rect)> {
+/// Decodes a provider result: PNG, or JPEG (Gemini may answer in either).
+fn decode_result(bytes: &[u8]) -> Result<(Surface, Rect)> {
     let opts = codecs::DecodeOptions {
         limits: codecs::Limits { max_width: MAX_SIDE, max_height: MAX_SIDE, max_pixels: MAX_PIXELS, max_alloc: 128 * 1024 * 1024 },
         keep_orientation: false,
     };
-    let img = codecs::decode_as_with(Format::Png, bytes, &opts).map_err(other)?.convert(ChannelLayout::Rgba, CodecSample::U8);
+    let format = match codecs::detect(bytes) {
+        Some(f @ (Format::Png | Format::Jpeg)) => f,
+        _ => return Err(other("image service returned an image that is neither PNG nor JPEG")),
+    };
+    let img = codecs::decode_as_with(format, bytes, &opts).map_err(other)?.convert(ChannelLayout::Rgba, CodecSample::U8);
     let r = Rect::from_xywh(0, 0, img.width(), img.height());
     limit(r, "image.ai")?;
     let mut s = Surface::new(PixelFormat::new(ColorMode::Rgb, SampleType::U8, true));
@@ -255,7 +249,7 @@ fn run(s: &mut Session, p: &Value, kind: Kind, cmd: &'static str, label: &'stati
     if p.get("model").is_some_and(|v| !v.is_string()) {
         return Err(bad(cmd, "`model` must be text"));
     }
-    let provider = OpenAiProvider::from_env(p.get("model").and_then(Value::as_str)).map_err(other)?;
+    let provider = photocraft_gen::provider_from_env(p.get("model").and_then(Value::as_str)).map_err(other)?;
     run_with_provider(s, p, kind, cmd, label, provider)
 }
 
@@ -368,30 +362,25 @@ fn run_with_provider(s: &mut Session, p: &Value, kind: Kind, cmd: &'static str, 
                 }
             };
             ctx.check()?;
-            ctx.progress(0.2, "Waiting for OpenAI");
+            ctx.progress(0.2, &format!("Waiting for {}", provider.name()));
+            // Edits and variations ask for the provider size closest to the area's shape.
+            let coded = if matches!(kind, Kind::Generate) { requested.clone() } else { provider.size_for(area.width(), area.height()) };
             let result = match kind {
-                Kind::Generate => provider.generate(&text, &requested),
-                Kind::Fill | Kind::Expand => provider.edit(
-                    input.as_deref().unwrap_or_default(),
-                    edit_mask.as_deref().unwrap_or_default(),
-                    &text,
-                    coded_size(area.width(), area.height()),
-                ),
-                Kind::Vary => provider.variations(input.as_deref().unwrap_or_default(), &text, coded_size(area.width(), area.height())),
+                Kind::Generate => provider.generate(&text, &coded),
+                Kind::Fill | Kind::Expand => provider.edit(input.as_deref().unwrap_or_default(), edit_mask.as_deref().unwrap_or_default(), &text, &coded),
+                Kind::Vary => provider.variations(input.as_deref().unwrap_or_default(), &text, &coded),
             }
             .map_err(other)?;
             ctx.check()?;
             ctx.progress(0.8, "Decoding image");
-            let (decoded, got) = decode_png(&result)?;
-            let output_size = if matches!(kind, Kind::Generate) { requested.as_str() } else { coded_size(area.width(), area.height()) };
-            let expected = match output_size {
-                "1024x1024" => Some((1024, 1024)),
-                "1024x1536" => Some((1024, 1536)),
-                "1536x1024" => Some((1536, 1024)),
-                _ => None,
-            };
-            if expected.is_some_and(|(w, h)| got.width() != w || got.height() != h) {
+            let (decoded, got) = decode_result(&result)?;
+            if !provider.accepts(&coded, got.width(), got.height()) {
                 return Err(other("image service returned a different image size than requested"));
+            }
+            if matches!(kind, Kind::Generate) {
+                // A generated image keeps the size the service chose (Gemini's 2:3 is 848x1264).
+                ctx.check()?;
+                return Ok((decoded, None, got));
             }
             let sx = f64::from(area.width()) / f64::from(got.width());
             let sy = f64::from(area.height()) / f64::from(got.height());
@@ -404,9 +393,9 @@ fn run_with_provider(s: &mut Session, p: &Value, kind: Kind, cmd: &'static str, 
                 match_expand_colors(&mut positioned, original, area, old, n.div_ceil(2).min(64));
             }
             ctx.check()?;
-            Ok((positioned, target_mask))
+            Ok((positioned, target_mask, area))
         },
-        move |s, (image, mask)| place(s, label, image, area, mask, expand),
+        move |s, (image, mask, placed)| place(s, label, image, placed, mask, expand),
     )
 }
 
@@ -417,7 +406,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Generate Image…",
             menu: &["Image"],
             shortcut: None,
-            params: r##"{"prompt":str,"size":"1024x1024|1024x1536|1536x1024|auto"?,"model":"gpt-image-1"?}"##,
+            params: r##"{"prompt":str,"size":"1024x1024|1024x1536|1536x1024|auto|16:9…"?,"model":str?} size may be a Gemini aspect ratio (1:1 2:3 3:2 3:4 4:3 4:5 5:4 9:16 16:9 21:9); model defaults to gemini-nano-banana-2.1 (Gemini) or gpt-image-1 (OpenAI)"##,
             enabled: key_enabled,
             run: |s, p| run(s, p, Kind::Generate, "image.ai.generate", "Generated Image"),
             journal: true,
@@ -427,7 +416,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Generative Fill…",
             menu: &["Edit"],
             shortcut: None,
-            params: r##"{"prompt":str,"model":"gpt-image-1"?} requires a selection"##,
+            params: r##"{"prompt":str,"model":str?} requires a selection"##,
             enabled: key_enabled,
             run: |s, p| run(s, p, Kind::Fill, "edit.ai.generativeFill", "Generative Fill"),
             journal: true,
@@ -437,7 +426,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Expand Canvas…",
             menu: &["Image"],
             shortcut: None,
-            params: r##"{"pixels":1..1024,"prompt":str,"model":"gpt-image-1"?}"##,
+            params: r##"{"pixels":1..1024,"prompt":str,"model":str?}"##,
             enabled: key_enabled,
             run: |s, p| run(s, p, Kind::Expand, "image.ai.expandCanvas", "Expand Canvas with AI"),
             journal: true,
@@ -447,7 +436,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Variations…",
             menu: &["Layer"],
             shortcut: None,
-            params: r##"{"prompt":str?,"source":"composite|layer"="composite","model":"gpt-image-1"?} composite uses the visible image; layer uses the active raster layer"##,
+            params: r##"{"prompt":str?,"source":"composite|layer"="composite","model":str?} composite uses the visible image; layer uses the active raster layer"##,
             enabled: key_enabled,
             run: |s, p| run(s, p, Kind::Vary, "layer.ai.variations", "Generated Variation"),
             journal: true,
@@ -458,9 +447,10 @@ pub fn specs() -> Vec<CommandSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use photocraft_gen::{GenError, HttpTransport};
+    use photocraft_gen::{GeminiProvider, GenError, HttpRequest, HttpResponse, HttpTransport, OpenAiProvider};
     use std::sync::{Arc, Condvar, Mutex};
 
+    /// `(url, auth header name, body)` of each request.
     type Request = (String, String, Vec<u8>);
     type Requests = Arc<Mutex<Vec<Request>>>;
     type Gate = Arc<(Mutex<(bool, bool)>, Condvar)>;
@@ -472,8 +462,8 @@ mod tests {
         gate: Option<Gate>,
     }
     impl HttpTransport for MockTransport {
-        fn post(&self, path: &str, _: &str, content_type: &str, body: &[u8]) -> photocraft_gen::Result<Vec<u8>> {
-            self.requests.lock().map_err(|_| GenError::Service("test lock"))?.push((path.into(), content_type.into(), body.to_vec()));
+        fn post(&self, r: &HttpRequest<'_>) -> photocraft_gen::Result<HttpResponse> {
+            self.requests.lock().map_err(|_| GenError::Service("test lock"))?.push((r.url.into(), r.auth.header().0.into(), r.body.to_vec()));
             if let Some(gate) = &self.gate {
                 let (lock, wake) = &**gate;
                 let mut state = lock.lock().map_err(|_| GenError::Service("test lock"))?;
@@ -483,24 +473,25 @@ mod tests {
                     state = wake.wait(state).map_err(|_| GenError::Service("test lock"))?;
                 }
             }
-            Ok((*self.reply).clone())
+            Ok(HttpResponse { status: 200, body: (*self.reply).clone() })
         }
+    }
+    fn transport(reply: Vec<u8>) -> (MockTransport, Requests) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        (MockTransport { requests: requests.clone(), reply: Arc::new(reply), gate: None }, requests)
     }
     fn provider(reply: Vec<u8>) -> (OpenAiProvider<MockTransport>, Requests) {
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let transport = MockTransport { requests: requests.clone(), reply: Arc::new(reply), gate: None };
+        let (transport, requests) = transport(reply);
         (OpenAiProvider::new("test-key".into(), "gpt-image-1", transport).unwrap(), requests)
     }
-    fn response(w: u32, h: u32) -> Vec<u8> {
-        let mut pixels = vec![0u8; w as usize * h as usize * 4];
-        for px in pixels.as_chunks_mut::<4>().0.iter_mut() {
-            px.copy_from_slice(&[255, 0, 0, 255]);
-        }
-        let image = Image::from_u8(w, h, ChannelLayout::Rgba, pixels).unwrap();
-        let png = codecs::encode(&image, Format::Png, &Default::default()).unwrap();
+    fn gemini(reply: Vec<u8>) -> (GeminiProvider<MockTransport>, Requests) {
+        let (transport, requests) = transport(reply);
+        (GeminiProvider::new("gemini-test-key".into(), photocraft_gen::GEMINI_DEFAULT_MODEL, transport).unwrap(), requests)
+    }
+    fn base64(bytes: &[u8]) -> String {
         const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut encoded = String::new();
-        for chunk in png.chunks(3) {
+        for chunk in bytes.chunks(3) {
             let a = chunk[0];
             let b = chunk.get(1).copied().unwrap_or(0);
             let c = chunk.get(2).copied().unwrap_or(0);
@@ -509,7 +500,40 @@ mod tests {
             encoded.push(if chunk.len() > 1 { ALPHABET[(((b & 15) << 2) | (c >> 6)) as usize] as char } else { '=' });
             encoded.push(if chunk.len() > 2 { ALPHABET[(c & 63) as usize] as char } else { '=' });
         }
-        serde_json::to_vec(&json!({"data":[{"b64_json":encoded}]})).unwrap()
+        encoded
+    }
+    fn red(w: u32, h: u32, format: Format) -> Vec<u8> {
+        let layout = if format == Format::Jpeg { ChannelLayout::Rgb } else { ChannelLayout::Rgba };
+        let px: &[u8] = if format == Format::Jpeg { &[255, 0, 0] } else { &[255, 0, 0, 255] };
+        let image = Image::from_u8(w, h, layout, px.repeat(w as usize * h as usize)).unwrap();
+        codecs::encode(&image, format, &Default::default()).unwrap()
+    }
+    fn response(w: u32, h: u32) -> Vec<u8> {
+        serde_json::to_vec(&json!({"data":[{"b64_json":base64(&red(w, h, Format::Png))}]})).unwrap()
+    }
+    /// A `generateContent` answer with a thought image first and the final image last.
+    fn gemini_response(w: u32, h: u32, format: Format) -> Vec<u8> {
+        let mime = if format == Format::Jpeg { "image/jpeg" } else { "image/png" };
+        serde_json::to_vec(&json!({"candidates":[{"content":{"role":"model","parts":[
+            {"thought":true,"inlineData":{"mimeType":"image/png","data":base64(&red(8, 8, Format::Png))}},
+            {"text":"Here you go."},
+            {"inlineData":{"mimeType":mime,"data":base64(&red(w, h, format))}}
+        ]},"finishReason":"STOP"}]}))
+        .unwrap()
+    }
+    fn gemini_body(requests: &Requests) -> Value {
+        serde_json::from_slice(&requests.lock().unwrap()[0].2).unwrap()
+    }
+    fn gemini_image(part: &Value) -> Image {
+        let data = part["inlineData"]["data"].as_str().unwrap();
+        let mut bytes = Vec::new();
+        let value = |c: u8| b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".iter().position(|&a| a == c).unwrap() as u32;
+        for chunk in data.as_bytes().chunks(4) {
+            let n = chunk.iter().filter(|&&c| c != b'=').count();
+            let v = chunk.iter().take(n).enumerate().fold(0u32, |v, (i, &c)| v | (value(c) << (18 - 6 * i)));
+            bytes.extend_from_slice(&v.to_be_bytes()[1..n]);
+        }
+        codecs::decode(&bytes).unwrap()
     }
     fn session(w: u32, h: u32) -> Session {
         let mut s = Session::new();
@@ -550,7 +574,7 @@ mod tests {
         let end = body[start..].windows(4).position(|w| w == b"\r\n--").unwrap() + start;
         codecs::decode_as(Format::Png, &body[start..end]).unwrap()
     }
-    fn call(s: &mut Session, kind: Kind, p: Value, provider: OpenAiProvider<MockTransport>) -> Result<Value> {
+    fn call(s: &mut Session, kind: Kind, p: Value, provider: impl ImageProvider + 'static) -> Result<Value> {
         let (id, label) = match kind {
             Kind::Generate => ("image.ai.generate", "Generated Image"),
             Kind::Fill => ("edit.ai.generativeFill", "Generative Fill"),
@@ -600,7 +624,7 @@ mod tests {
         assert_eq!(st.history.past_len(), depth + 1);
         assert_eq!(st.doc.layer(before.top_layer().unwrap()), before.layer(before.top_layer().unwrap()));
         assert!(st.doc.layer(photocraft_doc::LayerId(result["layer"].as_u64().unwrap())).is_some());
-        assert_eq!(requests.lock().unwrap()[0].0, "/generations");
+        assert!(requests.lock().unwrap()[0].0.ends_with("/images/generations"));
         let saved = photocraft_format::save_to_bytes(&st.doc, &Default::default()).unwrap();
         assert!(!saved.windows(b"test-key".len()).any(|w| w == b"test-key"));
         assert!(s.undo());
@@ -625,7 +649,7 @@ mod tests {
         assert_eq!(surf.rgba(10, 10)[3], 0.0);
         assert_eq!(surf.rgba(80, 70)[3], 0.0);
         let req = requests.lock().unwrap();
-        assert_eq!(req[0].0, "/edits");
+        assert!(req[0].0.ends_with("/images/edits"));
         let body = &req[0].2;
         let start = body.windows(b"name=\"mask\"".len()).position(|w| w == b"name=\"mask\"").unwrap();
         let png_start = body[start..].windows(4).position(|w| w == b"\r\n\r\n").unwrap() + start + 4;
@@ -791,7 +815,7 @@ mod tests {
         let depth = s.active().unwrap().history.past_len();
         let (p, requests) = provider(response(1536, 1024));
         call(&mut s, Kind::Vary, json!({"source":"layer"}), p).unwrap();
-        assert_eq!(requests.lock().unwrap()[0].0, "/edits");
+        assert!(requests.lock().unwrap()[0].0.ends_with("/images/edits"));
         assert_eq!(s.active().unwrap().history.past_len(), depth + 1);
         assert_eq!(s.active().unwrap().doc.layer(old_id), before.layer(old_id));
         assert!(s.undo());
@@ -924,5 +948,116 @@ mod tests {
         s.poll_jobs();
         assert_eq!(*s.active().unwrap().doc, before);
         assert_eq!(s.active().unwrap().history.past_len(), depth);
+    }
+
+    #[test]
+    fn gemini_generate_keeps_service_size_and_sends_documented_request() {
+        let mut s = session(96, 80);
+        let before = (*s.active().unwrap().doc).clone();
+        let depth = s.active().unwrap().history.past_len();
+        let (p, requests) = gemini(gemini_response(848, 1264, Format::Png));
+        let result = call(&mut s, Kind::Generate, json!({"prompt":"a tall tower","size":"1024x1536"}), p).unwrap();
+        assert_eq!(result["bounds"], json!([0, 0, 848, 1264]));
+        let req = requests.lock().unwrap();
+        assert!(req[0].0.ends_with("/v1beta/models/gemini-nano-banana-2.1:generateContent"), "{}", req[0].0);
+        assert_eq!(req[0].1, "x-goog-api-key");
+        drop(req);
+        let body = gemini_body(&requests);
+        assert_eq!(body["contents"][0]["parts"], json!([{"text":"a tall tower"}]));
+        assert_eq!(body["generationConfig"], json!({"responseModalities":["TEXT","IMAGE"],"imageConfig":{"aspectRatio":"2:3"}}));
+        let st = s.active().unwrap();
+        assert_eq!(st.history.past_len(), depth + 1);
+        let layer = st.doc.layer(photocraft_doc::LayerId(result["layer"].as_u64().unwrap())).unwrap().surface().unwrap();
+        assert!(layer.rgba(400, 1000)[0] > 0.99);
+        let saved = photocraft_format::save_to_bytes(&st.doc, &Default::default()).unwrap();
+        assert!(!saved.windows(b"gemini-test-key".len()).any(|w| w == b"gemini-test-key"));
+        assert!(s.undo());
+        assert_eq!(*s.active().unwrap().doc, before);
+    }
+
+    #[test]
+    fn gemini_fill_sends_mask_image_and_composites_only_the_selection() {
+        let mut s = session(96, 80);
+        s.execute("select.rect", json!({"x":0,"y":0,"width":4,"height":4,"antiAlias":false})).unwrap();
+        let before = (*s.active().unwrap().doc).clone();
+        let (p, requests) = gemini(gemini_response(1024, 1024, Format::Png));
+        let result = call(&mut s, Kind::Fill, json!({"prompt":"a red button"}), p).unwrap();
+        assert_eq!(result["bounds"], json!([0, 0, 68, 68]));
+        let st = s.active().unwrap();
+        assert_eq!(st.doc.layer(before.top_layer().unwrap()), before.layer(before.top_layer().unwrap()));
+        let surf = st.doc.layer(photocraft_doc::LayerId(result["layer"].as_u64().unwrap())).unwrap().surface().unwrap();
+        assert!(surf.rgba(1, 1)[3] > 0.99);
+        assert_eq!(surf.rgba(10, 10)[3], 0.0);
+        let body = gemini_body(&requests);
+        assert_eq!(body["generationConfig"]["imageConfig"]["aspectRatio"], "1:1");
+        let parts = body["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 3);
+        assert!(parts[0]["text"].as_str().unwrap().contains("change only the area that is white"));
+        assert!(parts[0]["text"].as_str().unwrap().contains("a red button"));
+        let image = gemini_image(&parts[1]);
+        assert_eq!((image.width(), image.height()), (68, 68));
+        let mask = gemini_image(&parts[2]).convert(ChannelLayout::Gray, CodecSample::U8);
+        assert_eq!((mask.width(), mask.height()), (68, 68));
+        assert_eq!(mask.data()[68 + 1], 255);
+        assert_eq!(mask.data()[10 * 68 + 10], 0);
+        assert!(s.undo());
+        assert_eq!(*s.active().unwrap().doc, before);
+    }
+
+    #[test]
+    fn gemini_expansion_and_jpeg_variation_use_the_closest_aspect_ratio() {
+        let mut s = session(8, 8);
+        s.execute("edit.fill", json!({"color":"#00ff00"})).unwrap();
+        let before = (*s.active().unwrap().doc).clone();
+        let (p, requests) = gemini(gemini_response(1024, 1024, Format::Png));
+        call(&mut s, Kind::Expand, json!({"prompt":"extend","pixels":2}), p).unwrap();
+        assert_eq!(s.active().unwrap().doc.size, Size::new(12, 12));
+        assert_eq!(gemini_body(&requests)["generationConfig"]["imageConfig"]["aspectRatio"], "1:1");
+        assert!(s.undo());
+        assert_eq!(*s.active().unwrap().doc, before);
+
+        let mut s = session(32, 24);
+        let before = (*s.active().unwrap().doc).clone();
+        let (p, requests) = gemini(gemini_response(1200, 896, Format::Jpeg));
+        let result = call(&mut s, Kind::Vary, json!({}), p).unwrap();
+        assert_eq!(result["bounds"], json!([0, 0, 32, 24]));
+        let body = gemini_body(&requests);
+        assert_eq!(body["generationConfig"]["imageConfig"]["aspectRatio"], "4:3");
+        assert_eq!(body["contents"][0]["parts"][0]["text"], "Create a faithful visual variation of this image.");
+        assert!(s.undo());
+        assert_eq!(*s.active().unwrap().doc, before);
+    }
+
+    #[test]
+    fn gemini_wrong_shape_or_blocked_reply_leaves_no_history() {
+        let mut s = session(32, 24);
+        let before = (*s.active().unwrap().doc).clone();
+        let depth = s.active().unwrap().history.past_len();
+        let (p, _) = gemini(gemini_response(1376, 768, Format::Png));
+        let e = call(&mut s, Kind::Generate, json!({"prompt":"square","size":"1024x1024"}), p).unwrap_err();
+        assert!(e.to_string().contains("different image size"), "{e}");
+        let (p, _) = gemini(br#"{"promptFeedback":{"blockReason":"SAFETY"}}"#.to_vec());
+        let e = call(&mut s, Kind::Generate, json!({"prompt":"square"}), p).unwrap_err();
+        assert!(e.to_string().contains("Gemini declined the request"), "{e}");
+        let (p, _) = gemini(br#"{"candidates":[{"content":{"parts":[{"text":"I can't"}]},"finishReason":"IMAGE_SAFETY"}]}"#.to_vec());
+        assert!(call(&mut s, Kind::Vary, json!({}), p).is_err());
+        let (p, requests) = gemini(gemini_response(1024, 1024, Format::Png));
+        assert!(call(&mut s, Kind::Generate, json!({"prompt":"x","size":"7:5"}), p).is_err());
+        assert!(requests.lock().unwrap().is_empty());
+        assert_eq!(*s.active().unwrap().doc, before);
+        assert_eq!(s.active().unwrap().history.past_len(), depth);
+    }
+
+    #[test]
+    fn disabled_commands_name_both_key_variables() {
+        // Only meaningful where the test process has no key; the selection rules themselves are
+        // tested in photocraft-gen with an injected environment.
+        if photocraft_gen::choose_provider(&photocraft_gen::env_var).is_ok() {
+            return;
+        }
+        let s = session(8, 8);
+        let why = key_enabled(&s).unwrap_err();
+        assert!(why.contains("GEMINI_API_KEY") && why.contains("OPENAI_API_KEY"), "{why}");
+        assert!(key_enabled(&Session::new()).unwrap_err().contains("no document"));
     }
 }
